@@ -2,8 +2,8 @@ import socket
 import os
 import time
 
-from rich.console import Console
-from rich.progress import Progress
+from rich.progress import Progress, BarColumn, TimeElapsedColumn, TransferSpeedColumn, Console
+
 
 SERVER_HOST = "192.168.1.107"
 SERVER_PORT = 12346
@@ -25,7 +25,13 @@ def upload_file(sock, filename):
 
     try:
         start_time = time.time()
-        with open(filename, "rb") as f, Progress() as progress:
+        with open(filename, "rb") as f, Progress(
+    "[blue]{task.description}",
+            BarColumn(),
+            TimeElapsedColumn(),
+            TransferSpeedColumn(),
+            "[bold blue]{task.percentage:.0f}%[/bold blue]"
+        ) as progress:
             task = progress.add_task(f"[cyan]Загрузка {filename}...", total=file_size)
 
             sock.sendall(f"UPLOAD {filename}\n".encode())
@@ -42,22 +48,45 @@ def upload_file(sock, filename):
             else:
                 console.log("[red]Ошибка загрузки файла")
         elapsed_time = time.time() - start_time
-        bitrate = (file_size * 8) / elapsed_time / 1024  # Кбит/с
-        console.log(f"[green]Файл {filename} загружен ({bitrate:.2f} Кбит/с)[/green]")
+        bitrate = file_size / elapsed_time / 1024 / 1024
+        console.log(f"[green]Файл {filename} загружен ({bitrate:.2f} MB/s)[/green]")
     except Exception as e:
         console.log(f"[red]Ошибка: {e}")
 
 
 def download_file(sock, filename):
     sock.sendall(f"DOWNLOAD {filename}\n".encode())
-    ack = sock.recv(1024).decode().strip()
+    ack: str = sock.recv(1024).decode().strip()
 
-    if ack == "READY":
+    mode = "wb"
+    start_pos = 0
+    if ack.startswith("RESUME"):
+        mode = "ab"
+        start_pos = int(ack.split()[1])
+
+        if not os.path.exists(filename):
+            sock.sendall("NOT FOUND".encode())
+            mode = "wb"
+            start_pos = 0
+        else:
+            sock.sendall("FOUND".encode())
+
+        ack = sock.recv(1024).decode().strip()
+
+    if ack.startswith("READY"):
         start_time = time.time()
-        with open(f"downloaded_{filename}", "wb") as f, Progress() as progress:
-            size_buf = size = int(sock.recv(1024).decode())
-            sock.sendall(str(size).encode())
-            task = progress.add_task(f"[cyan]Скачивание {filename}...", total=size)
+        with open(f"{filename}", mode) as f, Progress(
+    "[blue]{task.description}",
+            BarColumn(),
+            TimeElapsedColumn(),
+            TransferSpeedColumn(),
+            "[bold blue]{task.percentage:.0f}%[/bold blue]"
+        ) as progress:
+
+            size_buf = size = int(ack.split()[1])
+            sock.sendall("size is got".encode())
+            task = progress.add_task(f"[cyan]Скачивание {filename}...", total=size + start_pos)
+            progress.update(task, completed=start_pos)
 
             while size > 0:
                 chunk = sock.recv(1024)
@@ -66,8 +95,8 @@ def download_file(sock, filename):
                 size -= len(chunk)
 
         elapsed_time = time.time() - start_time
-        bitrate = (size_buf * 8) / elapsed_time / 1024  # Кбит/с
-        console.log(f"[green]Файл {filename} скачан ({bitrate:.2f} Кбит/с)[/green]")
+        bitrate = size_buf / elapsed_time / 1024 / 1024
+        console.log(f"[green]Файл {filename} скачан ({bitrate:.2f} MB/s)[/green]")
     else:
         console.log("[red]Файл не найден на сервере")
 
@@ -76,14 +105,6 @@ def main():
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.connect((SERVER_HOST, SERVER_PORT))
         console.log(f"[green]Подключено к {SERVER_HOST}:{SERVER_PORT}")
-
-
-
-        ack = str(sock.recv(1024).decode())
-        if len(ack.split()) > 1:
-            file_name = ack.split()[1]
-            file_size = ack.split()[2]
-
 
         while True:
             command = input("> ").strip()
