@@ -181,5 +181,5 @@ class TCPClient:
 
 
 if __name__ == "__main__":
-    client = TCPClient("172.20.10.2", 12346)
+    client = TCPClient("192.168.1.107", 12346)
     client.run()
