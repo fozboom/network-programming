@@ -112,8 +112,7 @@ class TCPServer:
             return f"TIME: {datetime.datetime.now()}\n"
 
         elif cmd in ("CLOSE", "EXIT", "QUIT"):
-            return "Соединение закрыто\n"
-
+            return "Connection closed\n"
         elif cmd == "UPLOAD":
             return self._handle_upload_file(client_socket, arg)
 
