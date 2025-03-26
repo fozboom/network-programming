@@ -1,5 +1,6 @@
 import argparse
-import subprocess
+from UDPClient import main as udp_main
+from TCPClient import TCPClient
 
 def main():
     parser = argparse.ArgumentParser(description="Выбор клиента: TCP или UDP")
@@ -9,9 +10,10 @@ def main():
     args = parser.parse_args()
 
     if args.tcp:
-        subprocess.run(["uv", "run", "Client/TCPClient.py"])
+        client = TCPClient("192.168.1.107", 12346)
+        client.run()
     elif args.udp:
-        subprocess.run(["uv", "run", "Client/UDPClient.py"])
+        udp_main()
     else:
         print("Укажите --tcp или --udp для выбора клиента.")
 
