@@ -7,7 +7,6 @@ import sys
 import time
 
 from rich.console import Console
-from rich.logging import RichHandler
 from rich.panel import Panel
 from rich.progress import (
     BarColumn,
@@ -18,17 +17,39 @@ from rich.progress import (
     TransferSpeedColumn,
 )
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(message)s",
-    datefmt="[%X]",
-    handlers=[RichHandler(rich_tracebacks=True)]
-)
-log = logging.getLogger("udp_server")
+
+def setup_logging(log_dir="logs"):
+    if not os.path.exists(log_dir):
+        os.makedirs(log_dir)
+    
+    current_time = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    log_file = os.path.join(log_dir, f"udp_server_{current_time}.log")
+    
+    logger = logging.getLogger("udp_server")
+    logger.setLevel(logging.DEBUG)
+    
+    formatter = logging.Formatter('%(asctime)s - %(message)s')
+    
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)
+    console_handler.setFormatter(formatter)
+    
+    file_handler = logging.FileHandler(log_file)
+    file_handler.setLevel(logging.DEBUG) 
+    file_handler.setFormatter(formatter)
+    
+    logger.addHandler(console_handler)
+    logger.addHandler(file_handler)
+    
+    logger.info(f"Logging initialized. Log file: {log_file}")
+    return logger
+
+log = setup_logging()
+
 console = Console()
 
 HOST = "0.0.0.0"
-PORT = 12345
+PORT = 12348
 
 UPLOAD_PATH = "./upload_files"
 SERVER_FILES_PATH = "./server_files/"
@@ -46,6 +67,7 @@ class File:
         self.mode = mode
         self.socket = socket
         self.address = address
+        self.file_map = None
 
     def wait(self, socket):
         readyToRead, _, _ = select.select([socket], [], [], 1)
@@ -72,25 +94,48 @@ class File:
                 console=console
             ) as progress:
                 task = progress.add_task(f"[green]Sending {os.path.basename(self.file_name)}", total=total_to_send)
-                seq_num = 0
+                seq_num = int(offset/BUFFER_SIZE)
+                log.info(f"Sending file {os.path.basename(self.file_name)} from {offset} to {total_to_send}")
                 while True:
                     data = file.read(WRITE_BUFFER_SIZE)
                     if not data:
                         break
-                    
+                   
                     packet = f"{seq_num}:{data.decode('utf-8')}"    
                     seq_num += 1
                     
                     start_time = time.time()
                     self.socket.sendto(packet.encode('utf-8'), self.address)
-                    ack, _ = self.socket.recvfrom(BUFFER_SIZE)
-                    ack = ack.decode('utf-8')
-                    log.info(f"Received ACK: {ack}")
+                    
                     end_time = time.time()
                     
                     send_time += end_time - start_time
                     sended_data_size += len(data)
                     progress.update(task, advance=len(data))
+                    
+                self.socket.sendto(b"FIN", self.address)
+                log.info('FIN I SENT')
+                while True:
+                    try:
+                        self.socket.settimeout(1)
+                        log.info("Waiting for missing packets")
+                        ack, _ = self.socket.recvfrom(BUFFER_SIZE)
+                        ack = ack.decode('utf-8')
+                        if ack.startswith("RETRY"):
+                            log.info(f"Received RETRY: {ack}")
+                            seq_num = int(ack.split(":")[1])
+                            position = seq_num * BUFFER_SIZE
+                            file.seek(position, 0)
+                            data = file.read(BUFFER_SIZE)
+                            packet = f"{seq_num}:{data.decode('utf-8')}"
+                            self.socket.sendto(packet.encode('utf-8'), self.address)
+                            _ = self.socket.recvfrom(BUFFER_SIZE)
+                        elif ack.startswith("FIN_ACK"):
+                            break
+                    except socket.timeout:
+                        log.info("Timeout waiting for missing packets")
+                        break
+                    
             
             return send_time
      
@@ -116,6 +161,7 @@ class File:
             log.info(f"Received RETRY: {seq_num}")
             received_packets[seq_num] = file_data
             self.socket.sendto(b"ACK", address)
+            log.info(f"Sent ACK: {seq_num}")
         new_missing_packets = self.check_missing_packets(received_packets)
         if new_missing_packets:
             self.retry_missing_packets(new_missing_packets, received_packets)
@@ -161,22 +207,6 @@ class File:
                                 missing_packets.append(i)
                         
                         
-                        # if missing_packets:
-                        #     log.warning(f"Missing packets: {missing_packets}")
-                        #     for seq_num in missing_packets:
-                        #         log.info(f"Sending RETRY: {seq_num}")
-                        #         retry_message = f"RETRY:{seq_num}"
-                        #         self.socket.sendto(retry_message.encode('utf-8'), address)
-                                
-                        #         data, address = self.socket.recvfrom(READ_BUFFER_SIZE)
-                        #         recv_data_size += len(data)
-                               
-                        #         seq_num, file_data = data.split(b':', 1)
-                        #         seq_num = int(seq_num.decode('utf-8'))
-                        #         log.info(f"Received RETRY: {seq_num}")
-                        #         received_packets[seq_num] = file_data
-                        #         self.socket.sendto(b"ACK", address)
-                        
                         missing_packets = self.check_missing_packets(received_packets)
                         if missing_packets:
                             log.info(f"Missing packets: {missing_packets}")
@@ -184,20 +214,30 @@ class File:
                     
                         log.info("Sending FIN_ACK")
                         self.socket.sendto(b"FIN_ACK", address)
+                        _ = self.socket.recvfrom(BUFFER_SIZE)   
                         break
+                    
+                    if data == b"CTRL_C":
+                        log.info("CTRL_C received, stopping")
+                        
+                        curr_seq = -1
+                        for seq_num in sorted(received_packets.keys()):
+                            if seq_num - 1 != curr_seq:
+                                log.info(f"Missing packet: {seq_num}")
+                                break
+                            curr_seq = seq_num
+                            file.write(received_packets[seq_num])
+                        return
+                            
                             
                     if not data:
                         log.info(f"File {self.file_name} received, stopping")
                         break
                     
-                    # Разделяем полученные данные на порядковый номер и данные файла
                     seq_num, file_data = data.split(b':', 1)
                     seq_num = int(seq_num.decode('utf-8'))
                     
-                    # Сохраняем данные файла в словарь в виде байтов
                     received_packets[seq_num] = file_data
-                    
-    
                     
                     progress.update(task, advance=len(file_data))
                 
@@ -208,15 +248,12 @@ class File:
                     speed = recv_data_size / transfer_time / 1024
                     log.info(f"Average receive speed: {speed:.2f} KB/s")
                     
-                # После получения всех пакетов записываем данные в файл
                 log.info(f"Writing {len(received_packets)} packets to file")
                 sorted_seq_nums = sorted(received_packets.keys())
 
                 for seq_num in sorted_seq_nums:
-                    # Записываем данные в файл в виде байтов
                     file.write(received_packets[seq_num])
                 received_packets.clear()
-#######################################################################################
 class ServerCommander:
     def __init__(self, server_socket):
         self.server_socket = server_socket
@@ -335,7 +372,6 @@ class ServerCommander:
     def set_client_address(self, client_address):
         self.client_address = client_address
 
-#######################################################################################
         
 class Server:
     def __init__(self, host, port):
@@ -359,7 +395,6 @@ class Server:
                 f"Server files: [yellow]{os.path.abspath(SERVER_FILES_PATH)}[/]"
             ))
             
-            # Создаем директории, если они не существуют
             os.makedirs(UPLOAD_PATH, exist_ok=True)
             os.makedirs(SERVER_FILES_PATH, exist_ok=True)
             
@@ -385,13 +420,14 @@ class Server:
                 self.client_address = client_address
                 commander.set_client_address(client_address)
                 commander.handle_command(msg.decode("utf-8"))
+            except socket.timeout:
+                pass
             except Exception as e:
                 log.error(f"Error handling client: {e}")
                 console.print(f"[bold red]ERROR:[/] {e}")
         
         self.server_socket.close()
 
-#######################################################################################
 
 if __name__ == "__main__":
     try:
