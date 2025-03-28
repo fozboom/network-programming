@@ -12,6 +12,10 @@ FRAME_SIZE = 8192
 
 console = Console()
 
+# Track transfer progress
+transfer_progress = {}  # {fileno: (total_size, transferred, filename, is_upload, last_update_time)}
+PROGRESS_UPDATE_INTERVAL = 1.0  # seconds between progress updates
+
 def setOptions(clientSocket):
     clientSocket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     clientSocket.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
@@ -39,6 +43,10 @@ def downloadStart(conn, fileName, commandText):
     setFileProperties(conn, True, file, fileSize, offset, commandText)
     printStartFileLoading(conn, fileName, False)
     
+    # Initialize progress tracking
+    fileno = conn.fileno()
+    transfer_progress[fileno] = (fileSize, offset, fileName, False, time.time())
+    
     return (True, None)
 
 def downloadFile(conn):
@@ -46,8 +54,31 @@ def downloadFile(conn):
 
     if data:
         conn.send(data)
+        
+        # Update progress
+        fileno = conn.fileno()
+        if fileno in transfer_progress:
+            total, transferred, filename, is_upload, last_update = transfer_progress[fileno]
+            transferred += len(data)
+            current_time = time.time()
+            
+            # Print progress update if enough time has passed
+            if current_time - last_update >= PROGRESS_UPDATE_INTERVAL:
+                percent = (transferred / total) * 100
+                console.print(f"[blue]Sending {filename}: {transferred}/{total} bytes ({percent:.1f}%)")
+                last_update = current_time
+                
+            transfer_progress[fileno] = (total, transferred, filename, is_upload, last_update)
+            
         return False
     else:
+        # Complete progress
+        fileno = conn.fileno()
+        if fileno in transfer_progress:
+            total, transferred, filename, is_upload, _ = transfer_progress[fileno]
+            percent = (transferred / total) * 100
+            console.print(f"[green]Completed sending {filename}: {transferred}/{total} bytes ({percent:.1f}%)")
+            del transfer_progress[fileno]
         return True
 
 def downloadEnd(conn):
@@ -73,6 +104,11 @@ def uploadStart(conn, fileName, commandText):
     setFileProperties(conn, True, file, fileSize, offset, commandText)
     printStartFileLoading(conn, fileName, True)
     
+    # Initialize progress tracking
+    fileno = conn.fileno()
+    remaining = fileSize - offset
+    transfer_progress[fileno] = (fileSize, offset, fileName, True, time.time())
+    
     return (True, None)
 
 def uploadFile(conn):
@@ -81,10 +117,30 @@ def uploadFile(conn):
         data = conn.recv(min(FRAME_SIZE, properties[fileno][3]))
         properties[fileno][3] -= len(data)
         properties[fileno][2].write(data)
+        
+        # Update progress
+        if fileno in transfer_progress:
+            total, transferred, filename, is_upload, last_update = transfer_progress[fileno]
+            transferred += len(data)
+            current_time = time.time()
+            
+            # Print progress update if enough time has passed
+            if current_time - last_update >= PROGRESS_UPDATE_INTERVAL:
+                percent = (transferred / total) * 100
+                console.print(f"[green]Receiving {filename}: {transferred}/{total} bytes ({percent:.1f}%)")
+                last_update = current_time
+                
+            transfer_progress[fileno] = (total, transferred, filename, is_upload, last_update)
 
     if properties[fileno][3] > properties[fileno][4]:
         return False
     else:
+        # Complete progress
+        if fileno in transfer_progress:
+            total, transferred, filename, is_upload, _ = transfer_progress[fileno]
+            percent = (transferred / total) * 100
+            console.print(f"[blue]Completed receiving {filename}: {transferred}/{total} bytes ({percent:.1f}%)")
+            del transfer_progress[fileno]
         return True
 
 def uploadEnd(conn):
@@ -141,6 +197,11 @@ def printStartFileLoading(conn, fileName, dir):
               f"Recipient: {properties[conn.fileno()][0][0]}\n")
 
 def unregClient(conn):
+    # Clean up progress tracking if client disconnects during transfer
+    fileno = conn.fileno()
+    if fileno in transfer_progress:
+        del transfer_progress[fileno]
+    
     del properties[conn.fileno()]
     connections.remove(conn)
     conn.close()
